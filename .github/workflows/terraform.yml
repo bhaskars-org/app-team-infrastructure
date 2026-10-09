@@ -1,0 +1,237 @@
+name: Terraform Infrastructure Deployment
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "applications/**/*.tf"
+      - "applications/**/*.tfvars"
+      - "applications/**/*.hcl"
+      - ".github/workflows/terraform.yml"
+
+  push:
+    branches:
+      - main
+    paths:
+      - "applications/**/*.tf"
+      - "applications/**/*.tfvars"
+      - "applications/**/*.hcl"
+      - ".github/workflows/terraform.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.9.8"
+  AWS_REGION: "ap-south-1"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  detect:
+    name: Detect Terraform Service
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      changed: ${{ steps.detect.outputs.changed }}
+      tf_dir: ${{ steps.detect.outputs.tf_dir }}
+      environment: ${{ steps.detect.outputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed service directory
+        id: detect
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            FILES=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          elif [[ "$EVENT_NAME" == "push" && "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            FILES=$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA")
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "Manual run: specify the target directory in the next implementation step."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            FILES=$(git ls-files)
+          fi
+
+          echo "Changed files:"
+          printf '%s\n' "$FILES"
+
+          DIRS=$(printf '%s\n' "$FILES" \
+            | grep -E '^applications/[^/]+/(dev|qa|uat|prod)/[^/]+/.*\.(tf|tfvars|hcl)$' \
+            | awk -F/ '{print $1 "/" $2 "/" $3 "/" $4}' \
+            | sort -u || true)
+
+          COUNT=$(printf '%s\n' "$DIRS" | sed '/^$/d' | wc -l)
+
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "No application Terraform changes detected."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$COUNT" -ne 1 ]]; then
+            echo "::error::This workflow accepts one Terraform service directory per PR."
+            echo "Changed service directories:"
+            echo "$DIRS"
+            exit 1
+          fi
+
+          TF_DIR=$(printf '%s\n' "$DIRS" | head -1)
+          ENVIRONMENT=$(echo "$TF_DIR" | cut -d/ -f3)
+
+          if [[ ! -f "$TF_DIR/main.tf" ]]; then
+            echo "::error::Missing $TF_DIR/main.tf"
+            exit 1
+          fi
+
+          echo "Terraform directory: $TF_DIR"
+          echo "Environment: $ENVIRONMENT"
+
+          echo "tf_dir=$TF_DIR" >> "$GITHUB_OUTPUT"
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+  terraform-plan:
+    name: Terraform Plan
+    needs: detect
+    if: needs.detect.outputs.changed == 'true' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::483527586166:role/Terraform-GitHubActions-Role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Format
+        working-directory: ${{ needs.detect.outputs.tf_dir }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        working-directory: ${{ needs.detect.outputs.tf_dir }}
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        working-directory: ${{ needs.detect.outputs.tf_dir }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: ${{ needs.detect.outputs.tf_dir }}
+        run: terraform plan -input=false -no-color
+
+  terraform-apply:
+    name: Terraform Apply
+    needs: detect
+    if: |
+      needs.detect.outputs.changed == 'true' &&
+      (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        github.event_name == 'workflow_dispatch'
+      )
+
+    runs-on: ubuntu-latest
+
+    # Configure required reviewers on this GitHub Environment.
+    environment:
+      name: ${{ needs.detect.outputs.environment }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::483527586166:role/Terraform-GitHubActions-Role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Format
+        working-directory: ${{ needs.detect.outputs.tf_dir }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        working-directory: ${{ needs.detect.outputs.tf_dir }}
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        working-directory: ${{ needs.detect.outputs.tf_dir }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: ${{ needs.detect.outputs.tf_dir }}
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ${{ needs.detect.outputs.tf_dir }}
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Show ACM DNS Validation Details
+        if: contains(needs.detect.outputs.tf_dir, '/ssl')
+        working-directory: ${{ needs.detect.outputs.tf_dir }}
+        shell: bash
+        run: |
+          echo "## ACM Certificate Details" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          terraform output -no-color certificate_arn \
+            >> "$GITHUB_STEP_SUMMARY" || true
+
+          terraform output -json dns_validation_records \
+            > /tmp/dns-records.json || true
+
+          if [[ -s /tmp/dns-records.json ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### DNS Validation Records (add in GoDaddy)" \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/dns-records.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          terraform output -no-color certificate_status \
+            >> "$GITHUB_STEP_SUMMARY" || true
