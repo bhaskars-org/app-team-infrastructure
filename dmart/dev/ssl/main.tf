@@ -30,7 +30,7 @@ provider "aws" {
 
 # SSL / ACM module owned by Cloud Team
 module "ssl" {
-  source = "https://github.com/bhaskar319-byte/cloud-team-terraform/tree/main"
+  source = "https://github.com/bhaskars-org/cloud-team-terraform.git"
 
   application  = var.application
   environment = var.environment
